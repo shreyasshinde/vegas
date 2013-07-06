@@ -155,7 +155,8 @@ def isConsoleTool():
 # Each worker will do a chunk of work for the whole simulation but setting up the route solver layer,
 # computing the route, applying the randomness and then re-generating the route and finally
 # writing all the routes to an output feature class.
-# @param parameters: a dictionary object containing all the parameters required for the worker simulation     
+# @param parameters: a dictionary object containing all the parameters required for the worker simulation  
+# @return: a string array of size 2 where first is a paths to routes processed by worker, the second is the path to the repeated count of each edge  
 def simulate_for_worker(parameters):
     '''
     Algorithm:
@@ -175,6 +176,9 @@ def simulate_for_worker(parameters):
     working_dir = parameters["working_directory"];
     worker_id = parameters["worker_id"];
     toolbox = parameters["toolbox"];
+    
+    # frequency of the occurance of each edge in the routes
+    edge_frequency = {};
     
     arcpy.AddMessage("Worker (" + worker_id + ") - working directory: " + working_dir);
     
@@ -200,6 +204,13 @@ def simulate_for_worker(parameters):
     arcpy.na.AddLocations(route_layer,stops_layer_name,loc_fc_path,"","");
     
     solved_routes_fc = fds_path + "\\routes"; #the fc where the route of each iteration will be stored
+
+    # create a table from the edge_frequency dictionary to keep track for the repeated edges
+    arcpy.AddMessage("Worker (" + worker_id + ") - creating the repeated frequency table.");
+    arcpy.management.CreateTable(fgdb_path, "repeated");
+    repeated_table_path = os.path.join(fgdb_path, "repeated");
+    arcpy.AddField_management(repeated_table_path, "FeatureID", "LONG");
+    arcpy.AddField_management(repeated_table_path, "Repeated", "LONG");
     
     # import the toolbox that applies the random energy
     arcpy.ImportToolbox(toolbox);
@@ -209,6 +220,7 @@ def simulate_for_worker(parameters):
         arcpy.AddMessage("Worker (" + worker_id + ") - iteration: " + str(i));
         
         # apply the random energy
+        arcpy.AddMessage("Worker (" + worker_id + ") - applying random energy." );
         arcpy.Randomize_tools(randomness, os.path.join(fds_path, "nodes"), os.path.join(fds_path, "edges"), fgdb_path);
         
         # re-build the network
@@ -216,19 +228,43 @@ def simulate_for_worker(parameters):
     
         # solve
         arcpy.na.Solve(route_layer, "HALT", "TERMINATE");
-        
+        arcpy.AddMessage("Worker (" + worker_id + ") - solving route." );
+        traversedEdges = arcpy.na.CopyTraversedSourceFeatures(route_layer,"in_memory").getOutput(0);
+        arcpy.AddMessage("Worker (" + worker_id + ") - creating edge frequency table." );
+        with arcpy.da.SearchCursor(traversedEdges, ("SourceOID")) as cursor:
+            for row in cursor:
+                edge_id = row[0];
+                if edge_id in edge_frequency:
+                    # increment repeated count
+                    edge_frequency[edge_id] = edge_frequency[edge_id] + 1;
+                else:
+                    # this edge occurred for the first time
+                    edge_frequency[edge_id] = 1;
+        del cursor;
+            
         # get the 'Routes' sub-layer from the route layer
-        routes_sub_layer = arcpy.mapping.ListLayers(route_layer,sub_layer_names["Routes"])[0]
-        arcpy.AddMessage("Routes sub layer: " + str(routes_sub_layer));
+        routes_sub_layer = arcpy.mapping.ListLayers(route_layer,sub_layer_names["Routes"])[0];
+        arcpy.AddMessage("Worker (" + worker_id + ") - routes sub layer: " + str(routes_sub_layer));
         
         # copy the layer as a output
         if arcpy.Exists(solved_routes_fc):
             arcpy.management.Append([routes_sub_layer], solved_routes_fc);
         else:
             arcpy.management.CopyFeatures(routes_sub_layer, solved_routes_fc); 
-    
+
+        # delete the in memory feature class            
+        arcpy.Delete_management("in_memory\\Junctions", "");
+        arcpy.Delete_management("in_memory\\Turns", "");
+        arcpy.Delete_management("in_memory\\Edges", "");
+            
+        # inserting the edges repeated frequency 
+        with arcpy.da.InsertCursor(repeated_table_path, ("FeatureID", "Repeated")) as cursor:
+            for edge_id in edge_frequency:
+                cursor.insertRow((edge_id, edge_frequency[edge_id]));
+        del cursor;
+        
     # iterations are complete
-    return solved_routes_fc;
+    return (solved_routes_fc, repeated_table_path);
     
     
 #
@@ -261,6 +297,7 @@ def simulate(source_pt, dest_pt, network_ds_path, randomness, iterations=1000, c
     # derive paths to feature dataset & fgdb
     network_ds_name = os.path.basename(network_ds_path);
     fds_path = os.path.dirname(network_ds_path);
+    edges_fc_path = fds_path + "\\edges";
     fds_name = os.path.basename(fds_path);
     fgdb_path = os.path.dirname(fds_path);
     fgdb_name = os.path.basename(fgdb_path);
@@ -268,7 +305,7 @@ def simulate(source_pt, dest_pt, network_ds_path, randomness, iterations=1000, c
     arcpy.AddMessage("File GDB path = " + str(fgdb_path));
     
     # create a new feature class inside the feature dataset to contain the source and destination points
-    locations_fc_path = fds_path + "\\" + "locations";
+    locations_fc_path = fds_path + "\\locations";
     if arcpy.Exists(locations_fc_path):
         arcpy.DeleteFeatures_management(locations_fc_path); 
     else:
@@ -325,7 +362,7 @@ def simulate(source_pt, dest_pt, network_ds_path, randomness, iterations=1000, c
     
     # every worker will return the path to the output routes fc
     for result in results:
-        worker_routes_fc = result.get();
+        (worker_routes_fc, repeated_fc) = result.get();
         arcpy.AddMessage("Worker output: " + str(worker_routes_fc));
         
         # we copy all the routes (features) from this output into the master output
@@ -334,7 +371,28 @@ def simulate(source_pt, dest_pt, network_ds_path, randomness, iterations=1000, c
             arcpy.Append_management([worker_routes_fc], output_routes_fc);
         else:
             arcpy.CopyFeatures_management(worker_routes_fc, output_routes_fc);
-        
+            
+        # iterate over every edge in the edges FC and update their repeated count
+        arcpy.AddMessage("Updating the 'repeated' field of each attribute.");
+        edge_frequency = {};
+        # read the edge_frequency table for this worker
+        with arcpy.da.SearchCursor(repeated_fc, ("FeatureID", "Repeated")) as cursor:
+            for row in cursor:
+                edge_frequency[row[0]] = row[1];
+            del cursor;
+        # update the repeated count for the edges
+        edit = arcpy.da.Editor(fgdb_path);
+        edit.startEditing(True, True);
+        edit.startOperation();
+        with arcpy.da.UpdateCursor(edges_fc_path, ("OBJECTID", "REPEATED")) as cursor:
+            for row in cursor:
+                obj_id = row[0];
+                if obj_id in edge_frequency:
+                    row[1] += edge_frequency[obj_id];
+                    cursor.updateRow(row);
+            del cursor;
+        edit.stopOperation();
+        edit.stopEditing(True); 
         
     # at this point every worker should have finished generating all the routes
     # and copied them into the master (output) routes feature class so we
@@ -349,9 +407,9 @@ def simulate(source_pt, dest_pt, network_ds_path, randomness, iterations=1000, c
             shutil.rmtree(worker_path);
     
     
-    return output_routes_fc;
     arcpy.AddMessage("Output feature class '" + output_routes_fc + "' have the simulated routes! Simulation is complete!"); 
     arcpy.AddMessage("Done!");       
+    return output_routes_fc;
         
 
 #
