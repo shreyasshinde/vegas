@@ -19,7 +19,7 @@ import shutil;
 # Returns the path to the source point feature class from which the paths need
 # to be calculated.
 # @return: path to a point feature class
-def get_source_points(paramIndex=0):
+def get_source_point(paramIndex=0):
     if isConsoleTool():
         source_pts_fc = str(raw_input("Enter path to source points feature class: "));
     else:
@@ -33,7 +33,7 @@ def get_source_points(paramIndex=0):
 # Returns the path to the destination points feature class to which the paths need
 # to be calculated.
 # @return: path to a point feature class
-def get_dest_points(paramIndex=0):
+def get_dest_point(paramIndex=0):
     if isConsoleTool():
         dest_pt_fc = str(raw_input("Enter path to destination points feature class: "));
     else:
@@ -196,23 +196,12 @@ def simulate_for_worker(parameters):
     arcpy.AddMessage("Worker (" + worker_id + ") - destination points fc path: " + dest_pts_fc_path);
     
     # make a route layer
-    num_of_facilities = arcpy.GetCount_management(source_pts_fc_path).getOutput(0); # this is required
-    outNALayer = arcpy.na.MakeClosestFacilityLayer(network_ds_path,"Route","Cost", default_number_facilities_to_find=num_of_facilities);
-    outNALayer = outNALayer.getOutput(0);
+    result = arcpy.na.MakeRouteLayer(network_ds_path,"Route","Cost");
+    route_layer = result.getOutput(0);
     
-    # get the names of all the sublayers within the route layer. 
-    # 'Facilities' layer becomes our source points.
-    # 'Incidents' layer becomes our destination points.
-    sub_layer_names = arcpy.na.GetNAClassNames(outNALayer);
-    for layer in sub_layer_names:
-        arcpy.AddMessage("Worker (" + worker_id + ") - " + layer + ".");
-        
-    facilitiesLayerName = sub_layer_names["Facilities"]
-    incidentsLayerName = sub_layer_names["Incidents"]
-    
-    # load the source and destination
-    arcpy.na.AddLocations(outNALayer, facilitiesLayerName, source_pts_fc_path, "", "");
-    arcpy.na.AddLocations(outNALayer, incidentsLayerName, dest_pts_fc_path, "", ""); 
+    # get the names of all the sublayers within the route layer. find the 'Stops' layer.
+    sub_layer_names = arcpy.na.GetNAClassNames(route_layer);
+    stops_layer_name = sub_layer_names["Stops"];
     
     solved_routes_fc = fds_path + "\\routes"; #the fc where the route of each iteration will be stored
 
@@ -237,36 +226,62 @@ def simulate_for_worker(parameters):
         # re-build the network
         arcpy.na.BuildNetwork(network_ds_path);
         
-        # solve
-        arcpy.na.Solve(outNALayer, "HALT", "TERMINATE");
-        arcpy.AddMessage("Worker (" + worker_id + ") - solving route." );
-        traversedEdges = arcpy.na.CopyTraversedSourceFeatures(outNALayer,"in_memory").getOutput(0);
-        arcpy.AddMessage("Worker (" + worker_id + ") - creating edge frequency table." );
-        with arcpy.da.SearchCursor(traversedEdges, ("SourceOID")) as cursor:
-            for row in cursor:
-                edge_id = row[0];
-                if edge_id in edge_frequency:
-                    # increment repeated count
-                    edge_frequency[edge_id] = edge_frequency[edge_id] + 1;
-                else:
-                    # this edge occurred for the first time
-                    edge_frequency[edge_id] = 1;
-        del cursor;
-        
-        # get the 'Routes' sub-layer from the route layer
-        routes_sub_layer = arcpy.mapping.ListLayers(outNALayer,sub_layer_names["CFRoutes"])[0];
-        arcpy.AddMessage("Worker (" + worker_id + ") - routes sub layer: " + str(routes_sub_layer));
-        
-        # copy the layer as a output
-        if arcpy.Exists(solved_routes_fc):
-            arcpy.management.Append([routes_sub_layer], solved_routes_fc);
-        else:
-            arcpy.management.CopyFeatures(routes_sub_layer, solved_routes_fc); 
-
-        # delete the in memory feature class            
-        arcpy.Delete_management("in_memory\\Junctions", "");
-        arcpy.Delete_management("in_memory\\Turns", "");
-        arcpy.Delete_management("in_memory\\Edges", "");
+        #
+        # we need to create a path from each point in the source feature class to
+        # every point in the destination feature class. we therefore iterate over
+        # the source feature class and destination feature class and create
+        # an in-memory feature class of the source and destination points.
+        with arcpy.da.SearchCursor(source_pts_fc_path, ("SHAPE")) as source_cursor:
+            for source_pt in source_cursor:
+                with arcpy.da.SearchCursor(dest_pts_fc_path, ("SHAPE")) as dest_cursor:
+                    for dest_pt in dest_cursor:
+                        # create an in-memory feature class for the locations for this iteration
+                        arcpy.CreateFeatureclass_management("in_memory", "locations", "POINT");
+                        with arcpy.da.InsertCursor("in_memory\\locations") as insert_cursor:
+                            insert_cursor.addRow(source_pt);
+                            insert_cursor.addRow(dest_pt);
+                            del insert_cursor;
+                            
+                            # add the locations to the stops layer
+                            arcpy.na.AddLocations(route_layer,stops_layer_name,"in_memory\\locations","","");
+                            
+                            # once the stops are loaded, delete the in_memory\locations fc
+                            arcpy.Delete_management("in_memory\\locations");
+    
+                            # solve
+                            arcpy.na.Solve(route_layer, "HALT", "TERMINATE");
+                            arcpy.AddMessage("Worker (" + worker_id + ") - solving route." );
+                            traversedEdges = arcpy.na.CopyTraversedSourceFeatures(route_layer,"in_memory").getOutput(0);
+                            arcpy.AddMessage("Worker (" + worker_id + ") - creating edge frequency table." );
+                            with arcpy.da.SearchCursor(traversedEdges, ("SourceOID")) as cursor:
+                                for row in cursor:
+                                    edge_id = row[0];
+                                    if edge_id in edge_frequency:
+                                        # increment repeated count
+                                        edge_frequency[edge_id] = edge_frequency[edge_id] + 1;
+                                    else:
+                                        # this edge occurred for the first time
+                                        edge_frequency[edge_id] = 1;
+                            del cursor;
+                                
+                            # get the 'Routes' sub-layer from the route layer
+                            routes_sub_layer = arcpy.mapping.ListLayers(route_layer,sub_layer_names["Routes"])[0];
+                            arcpy.AddMessage("Worker (" + worker_id + ") - routes sub layer: " + str(routes_sub_layer));
+                            
+                            # copy the layer as a output
+                            if arcpy.Exists(solved_routes_fc):
+                                arcpy.management.Append([routes_sub_layer], solved_routes_fc);
+                            else:
+                                arcpy.management.CopyFeatures(routes_sub_layer, solved_routes_fc); 
+                    
+                            # delete the in memory feature class            
+                            arcpy.Delete_management("in_memory\\Junctions", "");
+                            arcpy.Delete_management("in_memory\\Turns", "");
+                            arcpy.Delete_management("in_memory\\Edges", "");
+                            
+                        del dest_cursor;
+                    del source_cursor;
+                            
             
         # inserting the edges repeated frequency 
         with arcpy.da.InsertCursor(repeated_table_path, ("FeatureID", "Repeated")) as cursor:
@@ -418,10 +433,10 @@ def simulate(source_pts_fc_path, dest_pts_fc_path, network_ds_path, randomness, 
 def main():
     try:
         # read the source point
-        source_pts_fc = get_source_points(0);
+        source_pts_fc = get_source_point(0);
         arcpy.AddMessage("Source point: " + str(source_pts_fc));
         # read the destination point
-        dest_pts_fc = get_dest_points(1);
+        dest_pts_fc = get_dest_point(1);
         arcpy.AddMessage("Destination point: " + str(dest_pts_fc));
         # read the path to network dataset
         nd_path = get_network_dataset_path(2);
